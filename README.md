@@ -195,6 +195,11 @@ Best situations to demo live:
 
 ## 👥 Team
 
+| Name | LinkedIn |
+|---|---|
+| Ruchi Khare | [linkedin.com/in/ruchi-khare-3282464](https://www.linkedin.com/in/ruchi-khare-3282464) |
+| Omkar Dhurjad | [linkedin.com/in/omkar-dhurjad-6a4414225](https://www.linkedin.com/in/omkar-dhurjad-6a4414225) |
+
 Built for the **Gemini Live Agent Challenge** · #GeminiLiveAgentChallenge
 
 
