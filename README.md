@@ -197,8 +197,4 @@ Best situations to demo live:
 
 Built for the **Gemini Live Agent Challenge** · #GeminiLiveAgentChallenge
 
----
 
-## 📄 Licence
-
-MIT
