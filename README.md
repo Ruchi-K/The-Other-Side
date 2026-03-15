@@ -35,33 +35,40 @@ Describe any situation — a conflict, a news story, a strong opinion — in tex
 
 ## 🏗️ Architecture
 
-```
-Chrome Extension (popup.html · background.js · content.js)
-         │
-         ▼
-    Cloud Run (FastAPI)
-         │
-    ┌────┴────────────────────────────┐
-    │                                 │
-guardrails.py                   agent.py (ADK)
-Layer 1: regex scan             LlmAgent
-Layer 2: agent system prompt    gemini-2.5-flash
-Layer 3: toxicity scorer        GoogleSearchTool
-(gemini-2.0-flash-lite)         describe_perspective
-Vision API (media safety)       build_bridge
-         │                           │
-         └────────────┬──────────────┘
-                      │
-              Symmetric output router
-               ┌──────┼──────┐
-               │      │      │
-           Imagen 3  TTS   FFmpeg
-           (frames) (audio) (MP4→GCS)
-                      │
-                 Firestore
-              (sessions · feedback
-               analytics · video jobs)
-```
+![Architecture](docs/architecture.png)
+
+> [→ Detailed architecture diagram](docs/architecture.svg) · [→ Request flow diagram](docs/flow.svg)
+
+---
+
+## 🎬 Sample Outputs — by Input Type and Lens
+
+Each input type produces a symmetric output. The agent adapts headline, perspective, facts, closing question, and media generation payload per lens.
+
+### Audio Input
+*Situation: "A news podcast clip arguing that remote work is destroying company culture"*
+
+![Audio sample output](docs/sample_audio.png)
+
+**How it works:** Audio input → Gemini extracts the argument → generates SSML with adaptive voice profile (warm / authoritative / neutral matching the lens) → Cloud TTS renders MP3 → uploaded to GCS.
+
+---
+
+### Video Input
+*Situation: "A viral video of a climate activist blocking traffic on a motorway"*
+
+![Video sample output](docs/sample_video.png)
+
+**How it works:** Video URL → Gemini analyses the visual + context → generates a 3-scene video_script with per-scene frame_prompt + narration → Imagen 3 renders frames → FFmpeg stitches with TTS audio → MP4 uploaded to GCS via async job.
+
+---
+
+### Image Input
+*Situation: "A photo of an overflowing landfill site"*
+
+![Image sample output](docs/sample_image.png)
+
+**How it works:** Image → Vision API safety check → Gemini analyses visual content → generates visual_prompt tuned to the lens → Imagen 3 renders the reframe → PNG uploaded to GCS.
 
 **Google Cloud services used:**
 - Cloud Run — hosts the FastAPI backend + FFmpeg pipeline
@@ -202,4 +209,8 @@ Best situations to demo live:
 
 Built for the **Gemini Live Agent Challenge** · #GeminiLiveAgentChallenge
 
+---
 
+## 📄 Licence
+
+MIT
