@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "The Other Side",
+  "version": "1.0.0",
+  "description": "See any situation from the other side. Powered by Gemini.",
+  "permissions": ["contextMenus", "storage", "activeTab"],
+  "host_permissions": [
+    "https://*.run.app/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "◐ The Other Side"
+  },
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["content.js"]
+  }]
+}

@@ -1,0 +1,18 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+slowapi
+
+# Google Cloud
+google-cloud-aiplatform>=1.38.0
+google-cloud-texttospeech
+google-cloud-storage
+google-cloud-firestore
+google-cloud-vision
+
+# ADK
+google-adk
+
+# Vertex AI
+vertexai
