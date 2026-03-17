@@ -11,15 +11,15 @@ import subprocess
 import tempfile
 import time
 import uuid
+import wave
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import vertexai
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, BackgroundTasks
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from google.adk.cli.fast_api import get_fast_api_app
-from google.adk.sessions import InMemorySessionService
 from google.cloud import storage, texttospeech, firestore
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -30,10 +30,7 @@ from vertexai.preview.vision_models import ImageGenerationModel
 from agent import ANGLES, root_agent
 from guardrails import check_input_guardrail, sanitize_input, validate_output, check_media_safety
 
-# ─────────────────────────────────────────────────────────────
 # CONFIG
-# ─────────────────────────────────────────────────────────────
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("the-other-side")
 
@@ -50,49 +47,17 @@ ALLOWED_MIME_TYPES = {
     "video/mp4", "video/webm", "video/quicktime",
     "audio/mpeg", "audio/wav", "audio/ogg", "audio/webm",
 }
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
-
-# ─────────────────────────────────────────────────────────────
-# CLIENTS
-# ─────────────────────────────────────────────────────────────
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 gcs_client = storage.Client()
 tts_client = texttospeech.TextToSpeechClient()
 db         = firestore.Client()
-
-# ─────────────────────────────────────────────────────────────
-# RATE LIMITER
-# ─────────────────────────────────────────────────────────────
-
 limiter = Limiter(key_func=get_remote_address)
 
-# ─────────────────────────────────────────────────────────────
-# SESSION SERVICE
-# ─────────────────────────────────────────────────────────────
-
-session_service = InMemorySessionService()
-
-# ─────────────────────────────────────────────────────────────
-# ADK APP
-# ─────────────────────────────────────────────────────────────
-
-adk_app = get_fast_api_app(
-    agents_dir="/app",
-    session_service_uri="memory://",
-    allow_origins=["*"],
-    web=False,
-    auto_create_session=True,
-)
-
-# ─────────────────────────────────────────────────────────────
-# IN-MEMORY JOB STORE (for async video generation)
-# ─────────────────────────────────────────────────────────────
+# FIXED ADK INITIALIZATION
+adk_app = get_fast_api_app(agent_dir=".", web=False)
 
 jobs: dict = {}
-
-# ─────────────────────────────────────────────────────────────
-# LIFESPAN
-# ─────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -100,13 +65,8 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("◐ The Other Side shutting down")
 
-# ─────────────────────────────────────────────────────────────
-# APP
-# ─────────────────────────────────────────────────────────────
-
 app = FastAPI(
     title="The Other Side",
-    description="Because clarity starts where your comfort zone ends.",
     version=APP_VERSION,
     lifespan=lifespan,
 )
@@ -124,14 +84,11 @@ app.add_middleware(
 
 app.mount("/adk", adk_app)
 
-# ─────────────────────────────────────────────────────────────
 # MODELS
-# ─────────────────────────────────────────────────────────────
-
 class FlipRequest(BaseModel):
     situation: str
     angle: str = "empathy"
-    media_type: str = "text"   # text | image | audio | video
+    media_type: str = "text"
     session_id: Optional[str] = None
 
 class FeedbackRequest(BaseModel):
@@ -153,39 +110,21 @@ class AudioRequest(BaseModel):
 class VideoRequest(BaseModel):
     headline: str
     the_other_side: str
+    facts: list = []
     closing_prompt: str
     generation_payload: dict = {}
     angle: str = "empathy"
     session_id: Optional[str] = None
-    headline: str
-    the_other_side: str
-    facts: list
-    closing_prompt: str
-    generation_payload: dict
-    angle: str = "empathy"
-    session_id: Optional[str] = None
 
-# ─────────────────────────────────────────────────────────────
-# GCS HELPERS
-# ─────────────────────────────────────────────────────────────
-
+# HELPERS
 def upload_to_gcs(content: bytes, content_type: str, extension: str) -> str:
-    """Uploads bytes to GCS and returns the public URL."""
     bucket = gcs_client.bucket(BUCKET_NAME)
     filename = f"outputs/{uuid.uuid4()}.{extension}"
     blob = bucket.blob(filename)
     blob.upload_from_string(content, content_type=content_type)
     return f"https://storage.googleapis.com/{BUCKET_NAME}/{filename}"
 
-# ─────────────────────────────────────────────────────────────
-# IMAGEN 3 — image generation
-# ─────────────────────────────────────────────────────────────
-
 def generate_images(prompts: list[str]) -> list[bytes]:
-    """
-    Calls Imagen 3 for each prompt and returns raw image bytes.
-    Falls back gracefully if a prompt fails.
-    """
     model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-001")
     results = []
     for prompt in prompts:
@@ -193,566 +132,455 @@ def generate_images(prompts: list[str]) -> list[bytes]:
             response = model.generate_images(
                 prompt=prompt,
                 number_of_images=1,
-                aspect_ratio="16:9",
+                aspect_ratio="16:9"
             )
-            results.append(response.images[0]._image_bytes)
+            results.append(response.generated_images[0]._image_bytes)
         except Exception as e:
-            logger.error(f"Imagen 3 failed for prompt: {e}")
+            logger.error(f"Imagen failed: {e}")
     return results
 
-# ─────────────────────────────────────────────────────────────
-# CLOUD TTS — audio generation
-# ─────────────────────────────────────────────────────────────
-
-def generate_tts(text: str, voice_profile: str = "warm") -> bytes:
-    """
-    Generates MP3 audio from text using Cloud TTS.
-    Voice adapts to the lens voice_profile.
-    """
-    voice_map = {
-        "warm":          ("en-US-Studio-O", texttospeech.SsmlVoiceGender.FEMALE),
-        "authoritative": ("en-US-Studio-Q", texttospeech.SsmlVoiceGender.MALE),
-        "neutral":       ("en-US-Neural2-C", texttospeech.SsmlVoiceGender.FEMALE),
-    }
-    voice_name, gender = voice_map.get(voice_profile, voice_map["warm"])
-
+def generate_tts(text: str) -> bytes:
     synthesis_input = texttospeech.SynthesisInput(text=text)
     voice = texttospeech.VoiceSelectionParams(
         language_code="en-US",
-        name=voice_name,
-        ssml_gender=gender,
+        name="en-US-Studio-O"
     )
     audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3,
-        speaking_rate=0.95,
-        pitch=-1.0,
+        audio_encoding=texttospeech.AudioEncoding.MP3
     )
     response = tts_client.synthesize_speech(
         input=synthesis_input,
         voice=voice,
-        audio_config=audio_config,
+        audio_config=audio_config
     )
     return response.audio_content
 
-# ─────────────────────────────────────────────────────────────
-# FFMPEG VIDEO PIPELINE
-# ─────────────────────────────────────────────────────────────
-
-def build_video(image_bytes_list: list[bytes], audio_bytes: bytes, texts: list[str]) -> bytes:
-    """
-    Stitches Imagen 3 images + TTS audio into an MP4 using FFmpeg.
-    Each image is shown for an equal slice of the audio duration.
-    Returns raw MP4 bytes.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Write images to disk
-        img_paths = []
-        for i, img_bytes in enumerate(image_bytes_list):
-            path = os.path.join(tmpdir, f"frame_{i:02d}.jpg")
-            with open(path, "wb") as f:
-                f.write(img_bytes)
-            img_paths.append(path)
-
-        # Write audio to disk
-        audio_path = os.path.join(tmpdir, "narration.mp3")
-        with open(audio_path, "wb") as f:
-            f.write(audio_bytes)
-
-        # Get audio duration
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
-            capture_output=True, text=True
-        )
-        try:
-            duration = float(probe.stdout.strip())
-        except Exception:
-            duration = 30.0
-
-        # Each image gets equal screen time
-        per_image = duration / max(len(img_paths), 1)
-
-        # Build FFmpeg concat input file
-        concat_path = os.path.join(tmpdir, "concat.txt")
-        with open(concat_path, "w") as f:
-            for path in img_paths:
-                f.write(f"file '{path}'\n")
-                f.write(f"duration {per_image:.2f}\n")
-            # FFmpeg concat needs the last image repeated without duration
-            if img_paths:
-                f.write(f"file '{img_paths[-1]}'\n")
-
-        output_path = os.path.join(tmpdir, "output.mp4")
-
-        # FFmpeg: slideshow + audio + scale to 1280x720 + text overlay
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", concat_path,
-            "-i", audio_path,
-            "-vf", (
-                "scale=1280:720:force_original_aspect_ratio=decrease,"
-                "pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,"
-                f"drawtext=text='◐ The Other Side':fontcolor=white:fontsize=28:"
-                f"x=40:y=40:alpha=0.7"
-            ),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest",
-            "-movflags", "+faststart",
-            output_path,
-        ]
-
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
-        if result.returncode != 0:
-            logger.error(f"FFmpeg error: {result.stderr.decode()}")
-            raise RuntimeError("Video generation failed")
-
-        with open(output_path, "rb") as f:
-            return f.read()
-
-# ─────────────────────────────────────────────────────────────
-# VEO 2 — real motion video generation
-# ─────────────────────────────────────────────────────────────
-
-def generate_veo_video(prompt: str, job_id: str) -> str:
-    """
-    Calls Veo 2 to generate a real motion video.
-    Returns the public GCS URL of the generated MP4.
-    """
-    from google import genai
-    from google.genai import types as genai_types
-
-    client = genai.Client(vertexai=True, project=PROJECT_ID, location=REGION)
-    output_gcs_uri = f"gs://{BUCKET_NAME}/veo/{job_id}/"
-
-    operation = client.models.generate_videos(
-        model="veo-2.0-generate-001",
-        prompt=prompt,
-        config=genai_types.GenerateVideosConfig(
-            output_gcs_uri=output_gcs_uri,
-            duration_seconds=5,
-            number_of_videos=1,
-        ),
-    )
-
-    import time
-    while not operation.done:
-        time.sleep(10)
-        operation = client.operations.get(operation)
-
-    videos = operation.response.generated_videos if operation.response else []
-    if not videos:
-        raise RuntimeError("Veo 2 returned no videos")
-
-    gcs_uri = videos[0].video.uri
-    # Convert gs:// to public https:// URL
-    public_url = gcs_uri.replace("gs://", "https://storage.googleapis.com/")
-
-    # Make the file publicly readable
-    bucket = gcs_client.bucket(BUCKET_NAME)
-    blob_name = gcs_uri.replace(f"gs://{BUCKET_NAME}/", "")
-    blob = bucket.blob(blob_name)
-    blob.make_public()
-
-    return public_url
-
-
-# ─────────────────────────────────────────────────────────────
-# ASYNC VIDEO JOB — uses Veo 2
-# ─────────────────────────────────────────────────────────────
-
-async def process_video_job(job_id: str, req: VideoRequest):
-    """
-    Background task: Veo 2 generates real motion video → GCS.
-    Falls back to Imagen 3 + FFmpeg if Veo 2 fails.
-    """
-    try:
-        jobs[job_id] = {"status": "generating_video"}
-        angle_cfg = ANGLES.get(req.angle, ANGLES["empathy"])
-        payload = req.generation_payload or {}
-
-        # Build Veo 2 prompt from video_script scenes or visual_prompt
-        video_script = payload.get("video_script", [])
-        if video_script:
-            scene_prompts = [s.get("frame_prompt", "") for s in video_script[:3] if s.get("frame_prompt")]
-            veo_prompt = f"{req.headline}. " + " Then, ".join(scene_prompts)
-        else:
-            visual_prompt = payload.get("visual_prompt") or req.headline
-            veo_prompt = f"{visual_prompt}. Cinematic, 4K, emotional, documentary style."
-
-        # Trim prompt to 500 chars (Veo limit)
-        veo_prompt = veo_prompt[:500]
-
-        loop = asyncio.get_event_loop()
-
-        try:
-            # Try Veo 2 first
-            video_url = await loop.run_in_executor(
-                None, generate_veo_video, veo_prompt, job_id
-            )
-            jobs[job_id] = {"status": "completed", "video_url": video_url}
-            logger.info(f"Veo 2 job {job_id} completed: {video_url}")
-
-        except Exception as veo_err:
-            # Fallback to Imagen 3 + FFmpeg slideshow
-            logger.warning(f"Veo 2 failed ({veo_err}), falling back to Imagen 3 + FFmpeg")
-            jobs[job_id] = {"status": "generating_images"}
-
-            if video_script:
-                prompts = [s.get("frame_prompt", req.headline) for s in video_script[:3]]
-            else:
-                visual_prompt = payload.get("visual_prompt") or req.headline
-                prompts = [
-                    f"{visual_prompt} — establishing shot, cinematic, 4K",
-                    f"{visual_prompt} — close-up emotional detail, soft light",
-                    f"A bridge between two worlds. {req.closing_prompt}. Cinematic.",
-                ]
-
-            image_bytes_list = await loop.run_in_executor(None, generate_images, prompts)
-            if not image_bytes_list:
-                raise RuntimeError("Both Veo 2 and Imagen 3 failed")
-
-            jobs[job_id] = {"status": "generating_audio"}
-            narration_parts = [req.headline, req.the_other_side]
-            if video_script:
-                narration_parts = [s.get("narration", "") for s in video_script if s.get("narration")]
-            narration_parts.append(req.closing_prompt)
-            narration = " ... ".join(filter(None, narration_parts))
-            voice_profile = payload.get("voice_profile", angle_cfg["voice"])
-            audio_bytes = await loop.run_in_executor(None, generate_tts, narration, voice_profile)
-
-            jobs[job_id] = {"status": "assembling_video"}
-            texts = [req.headline, req.the_other_side, req.closing_prompt]
-            video_bytes = await loop.run_in_executor(None, build_video, image_bytes_list, audio_bytes, texts)
-
-            jobs[job_id] = {"status": "uploading"}
-            video_url = await loop.run_in_executor(None, upload_to_gcs, video_bytes, "video/mp4", "mp4")
-            jobs[job_id] = {"status": "completed", "video_url": video_url}
-            logger.info(f"Fallback video job {job_id} completed: {video_url}")
-
-        # Log to Firestore
-        try:
-            db.collection("video_jobs").document(job_id).set({
-                "session_id": req.session_id,
-                "angle":      req.angle,
-                "video_url":  video_url,
-                "status":     "completed",
-                "ts":         int(time.time()),
-            })
-        except Exception as e:
-            logger.warning(f"Firestore log failed: {e}")
-
-    except Exception as e:
-        logger.error(f"Video job {job_id} failed: {e}")
-        jobs[job_id] = {"status": "failed", "error": str(e)}
-
-# ─────────────────────────────────────────────────────────────
-# LOGGING HELPERS
-# ─────────────────────────────────────────────────────────────
-
-def log_session(entry: dict):
-    logger.info(f"SESSION | {json.dumps(entry)}")
-    try:
-        db.collection("sessions").document(entry["session_id"]).set(entry)
-    except Exception as e:
-        logger.warning(f"Firestore session log failed: {e}")
-
-def log_feedback(entry: dict):
-    logger.info(f"FEEDBACK | {json.dumps(entry)}")
-    try:
-        db.collection("feedback").document(entry["session_id"]).set(entry)
-    except Exception as e:
-        logger.warning(f"Firestore feedback log failed: {e}")
-
-# ─────────────────────────────────────────────────────────────
 # ROUTES
-# ─────────────────────────────────────────────────────────────
-
 @app.get("/")
 async def root():
-    return {
-        "service": "The Other Side",
-        "version": APP_VERSION,
-        "tagline": "Because clarity starts where your comfort zone ends.",
-    }
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "ts": int(time.time())}
+    return {"service": "The Other Side"}
 
 @app.get("/angles")
 async def get_angles():
     return {
         "angles": [
-            {"id": k, "label": v["label"], "desc": v["desc"], "closing": v["closing"]}
-            for k, v in ANGLES.items()
+            {"id": key, "label": value["label"], "desc": value["desc"]}
+            for key, value in ANGLES.items()
         ]
     }
 
 @app.post("/flip")
 @limiter.limit("10/minute")
-async def flip(request: Request, body: FlipRequest):
-    """
-    Main endpoint. Runs Layer 1 guardrail, logs session,
-    returns ADK payload for client to call /adk/run.
-    """
+async def flip(request: Request, body: FlipRequest, background_tasks: BackgroundTasks):
+    import httpx
+
     session_id = body.session_id or str(uuid.uuid4())
+    clean_situation = sanitize_input(body.situation)
+    user_id = "ruchi"
+    prompt = f"Shift {clean_situation} using {body.angle}"
 
-    # Layer 1 guardrail
-    try:
-        clean_situation = sanitize_input(body.situation)
-    except ValueError as e:
-        return JSONResponse(status_code=200, content={
-            "session_id": session_id,
-            "declined": True,
-            "message": str(e),
-            "output": None,
-        })
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        session_url = f"http://localhost:8080/adk/apps/{APP_NAME}/users/{user_id}/sessions/{session_id}"
+        await client.post(session_url, json={})
 
-    guardrail = check_input_guardrail(clean_situation)
-    if not guardrail["safe"]:
-        log_session({
-            "session_id": session_id,
-            "guardrail_triggered": True,
-            "lens_used": body.angle,
-            "ts": int(time.time()),
-        })
-        return JSONResponse(status_code=200, content={
-            "session_id": session_id,
-            "declined": True,
-            "message": guardrail["reason"],
-            "output": None,
-        })
-
-    log_session({
-        "session_id": session_id,
-        "guardrail_triggered": False,
-        "lens_used": body.angle,
-        "media_type": body.media_type,
-        "ts": int(time.time()),
-    })
-
-    # Enrich URL inputs with page title/description for better Gemini context
-    enriched_situation = clean_situation
-    if body.media_type in ["video", "audio", "text"] and (
-        clean_situation.startswith("http") or
-        "[VIDEO_URL]" in clean_situation or
-        "[AUDIO_URL]" in clean_situation or
-        "URL:" in clean_situation
-    ):
-        try:
-            import httpx
-            url_to_fetch = clean_situation.split()[-1].strip("[]")
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                r = await client.get(url_to_fetch, headers={"User-Agent": "Mozilla/5.0"})
-                if r.status_code == 200:
-                    import re
-                    title = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.IGNORECASE | re.DOTALL)
-                    desc  = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)["\']', r.text, re.IGNORECASE)
-                    og_title = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']*)["\']', r.text, re.IGNORECASE)
-                    og_desc  = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']*)["\']', r.text, re.IGNORECASE)
-                    parts = []
-                    if og_title: parts.append(f"Title: {og_title.group(1)[:200]}")
-                    elif title:  parts.append(f"Title: {title.group(1)[:200]}")
-                    if og_desc:  parts.append(f"Description: {og_desc.group(1)[:300]}")
-                    elif desc:   parts.append(f"Description: {desc.group(1)[:300]}")
-                    if parts:
-                        enriched_situation = clean_situation + "\n\n" + "\n".join(parts)
-                        logger.info(f"URL enriched with: {parts[0][:80]}")
-        except Exception as e:
-            logger.warning(f"URL enrichment failed: {e}")
-
-    return {
-        "session_id": session_id,
-        "declined": False,
-        "adk_run_endpoint": "/adk/run",
-        "adk_run_payload": {
-            "app_name":    APP_NAME,
-            "user_id":     "anon",
-            "session_id":  session_id,
-            "new_message": {
-                "role": "user",
-                "parts": [{
-                    "text": (
-                        f"SITUATION:\n{enriched_situation}\n\n"
-                        f"ANGLE: {body.angle}\n"
-                        f"MEDIA TYPE: {body.media_type}\n\n"
-                        "Run describe_perspective → build_bridge. "
-                        "Return the raw JSON only."
-                    )
-                }],
-            },
-        },
-    }
-
-
-@app.post("/generate-audio")
-@limiter.limit("20/minute")
-async def generate_audio_endpoint(request: Request, body: dict):
-    """Generates TTS narration and returns GCS URL."""
-    text = body.get("text", "")
-    angle = body.get("angle", "empathy")
-    if not text:
-        raise HTTPException(status_code=400, detail="text is required")
-
-    angle_cfg = ANGLES.get(angle, ANGLES["empathy"])
-    try:
-        loop = asyncio.get_event_loop()
-        audio_bytes = await loop.run_in_executor(
-            None, generate_tts, text, angle_cfg["voice"]
+        run_resp = await client.post(
+            "http://localhost:8080/adk/run",
+            json={
+                "app_name": APP_NAME,
+                "user_id": user_id,
+                "session_id": session_id,
+                "new_message": {
+                    "role": "user",
+                    "parts": [{"text": prompt}]
+                },
+                "streaming": False
+            }
         )
-        audio_url = await loop.run_in_executor(
-            None, upload_to_gcs, audio_bytes, "audio/mp3", "mp3"
-        )
-        return {"audio_url": audio_url}
-    except Exception as e:
-        logger.error(f"Audio generation failed: {e}")
-        raise HTTPException(status_code=500, detail="Audio generation failed")
+        run_resp.raise_for_status()
+        events = run_resp.json()
 
+    final_text = None
+    for event in reversed(events):
+        content = event.get("content") or {}
+        for part in (content.get("parts") or []):
+            if part.get("text"):
+                final_text = part["text"]
+                break
+        if final_text:
+            break
 
-@app.post("/generate-video")
-@limiter.limit("5/minute")
-async def generate_video_endpoint(
-    request: Request,
-    body: VideoRequest,
-    background_tasks: BackgroundTasks,
-):
-    """
-    Kicks off async video generation job.
-    Returns job_id immediately — client polls /video-status/{job_id}.
-    """
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "queued"}
-    background_tasks.add_task(process_video_job, job_id, body)
-    return {"job_id": job_id, "status": "queued"}
+    if not final_text:
+        raise HTTPException(500, "ADK returned no text output")
 
-
-@app.post("/generate-audio-job")
-@limiter.limit("20/minute")
-async def generate_audio_job_endpoint(
-    request: Request,
-    body: AudioRequest,
-    background_tasks: BackgroundTasks,
-):
-    """
-    Async audio generation job.
-    Returns job_id immediately — client polls /video-status/{job_id}.
-    """
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "queued"}
-    background_tasks.add_task(process_audio_job, job_id, body)
-    return {"job_id": job_id, "status": "queued"}
-
-
-async def process_audio_job(job_id: str, req: AudioRequest):
-    """Background task: TTS → MP3 → GCS."""
     try:
-        jobs[job_id] = {"status": "generating_audio"}
-        angle_cfg = ANGLES.get(req.angle, ANGLES["empathy"])
-        payload = req.generation_payload or {}
+        cleaned = final_text.strip()
 
-        # Build narration from SSML or plain text
-        ssml = payload.get("ssml")
-        voice_profile = payload.get("voice_profile", angle_cfg["voice"])
+        if cleaned.startswith("```"):
+            cleaned = cleaned.replace("```json", "", 1)
+            cleaned = cleaned.replace("```", "")
+            cleaned = cleaned.strip()
 
-        if ssml:
-            narration = ssml
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1:
+            cleaned = cleaned[start:end + 1]
+
+        parsed = json.loads(cleaned)
+
+        facts = parsed.get("facts", [])
+        if isinstance(facts, list):
+            normalized_facts = []
+            for item in facts:
+                if isinstance(item, str):
+                    normalized_facts.append({
+                        "fact": item,
+                        "confidence": "moderate",
+                        "source_hint": ""
+                    })
+                elif isinstance(item, dict):
+                    normalized_facts.append({
+                        "fact": item.get("fact", ""),
+                        "confidence": item.get("confidence", "moderate"),
+                        "source_hint": item.get("source_hint", "")
+                    })
+                else:
+                    normalized_facts.append({
+                        "fact": str(item),
+                        "confidence": "moderate",
+                        "source_hint": ""
+                    })
         else:
-            narration = " ... ".join(filter(None, [
-                req.headline,
-                req.the_other_side,
-                req.closing_prompt,
-            ]))
+            normalized_facts = []
 
-        loop = asyncio.get_event_loop()
-        audio_bytes = await loop.run_in_executor(None, generate_tts, narration, voice_profile)
-
-        jobs[job_id] = {"status": "uploading"}
-        audio_url = await loop.run_in_executor(
-            None, upload_to_gcs, audio_bytes, "audio/mp3", "mp3"
-        )
-        jobs[job_id] = {"status": "completed", "audio_url": audio_url}
-        logger.info(f"Audio job {job_id} completed: {audio_url}")
-
-    except Exception as e:
-        logger.error(f"Audio job {job_id} failed: {e}")
-        jobs[job_id] = {"status": "failed", "error": str(e)}
-async def video_status(job_id: str):
-    """Poll this to check video generation progress."""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
-
-
-@app.post("/upload-media")
-@limiter.limit("20/minute")
-async def upload_media(request: Request, file: UploadFile = File(...)):
-    """
-    Accepts image/video/audio for multimodal analysis.
-    Runs Vision API safety check on images.
-    Never written to disk — base64 in memory only.
-    """
-    if file.content_type not in ALLOWED_MIME_TYPES:
-        raise HTTPException(status_code=415, detail=f"Unsupported media type: {file.content_type}")
-
-    content = await file.read(MAX_UPLOAD_BYTES + 1)
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit")
-
-    # Vision API safety check for images
-    if file.content_type.startswith("image/"):
-        if not check_media_safety(content):
-            raise HTTPException(status_code=400, detail="Media failed safety check")
-
-    encoded = base64.b64encode(content).decode("utf-8")
-    return {
-        "media_type":  file.content_type,
-        "filename":    file.filename,
-        "size_bytes":  len(content),
-        "base64_data": encoded,
-        "privacy":     "Processed in memory and discarded. Nothing stored.",
-    }
-
-
-@app.post("/feedback")
-@limiter.limit("30/minute")
-async def submit_feedback(request: Request, body: FeedbackRequest):
-    if not (1 <= body.fairness_score <= 5):
-        raise HTTPException(status_code=400, detail="fairness_score must be 1-5")
-    if not (1 <= body.quality_score <= 5):
-        raise HTTPException(status_code=400, detail="quality_score must be 1-5")
-
-    shift_score = round(
-        (body.fairness_score / 5 * 4)
-        + (body.quality_score  / 5 * 4)
-        + (2 if body.perspective_new else 0),
-        2,
-    )
-
-    log_feedback({
-        "session_id":      body.session_id,
-        "perspective_new": body.perspective_new,
-        "fairness_score":  body.fairness_score,
-        "quality_score":   body.quality_score,
-        "quality_issue":   body.quality_issue,
-        "what_shifted":    body.what_shifted,
-        "shift_score":     shift_score,
-        "ts":              int(time.time()),
-    })
-
-    return {"received": True, "session_id": body.session_id, "shift_score": shift_score}
-
-
-# ─────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────
+        return {
+            "session_id": session_id,
+            "perspective": parsed.get("the_other_side") or cleaned,
+            "headline": parsed.get("headline"),
+            "the_other_side": parsed.get("the_other_side"),
+            "facts": normalized_facts,
+            "category": parsed.get("category"),
+            "media_type": parsed.get("media_type", body.media_type),
+            "generation_payload": parsed.get("generation_payload", {}),
+            "angle_label": parsed.get("angle_label"),
+            "closing_prompt": parsed.get("closing_prompt"),
+            "declined": parsed.get("declined", False),
+        }
+    except Exception:
+        return {
+            "session_id": session_id,
+            "perspective": final_text,
+            "media_type": body.media_type,
+            "raw_response": final_text,
+        }
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8080)),
-        reload=False,
-        log_level="info",
+        port=int(os.environ.get("PORT", 8080))
     )
+
+# -------- MEDIA INGESTION IMPORTS --------
+import trafilatura
+import subprocess
+from urllib.parse import urlparse
+import yt_dlp
+from google.cloud import speech
+
+# -------- MEDIA INGESTION HELPERS --------
+
+speech_client = speech.SpeechClient()
+
+def extract_article_text(url: str) -> str:
+    downloaded = trafilatura.fetch_url(url)
+    if not downloaded:
+        raise Exception("Could not download article")
+
+    text = trafilatura.extract(downloaded)
+
+    if not text:
+        raise Exception("Could not extract article text")
+
+    return text
+
+
+def extract_audio_from_video(video_path: str) -> str:
+    audio_path = video_path + ".wav"
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_path,
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            audio_path,
+        ],
+        check=True,
+    )
+
+    return audio_path
+
+
+def download_youtube_audio(url: str) -> str:
+    output_path = "/tmp/youtube_audio.%(ext)s"
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": output_path,
+        "quiet": True,
+        "noplaylist": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        downloaded = ydl.prepare_filename(info)
+
+    return downloaded
+
+
+def convert_to_wav(input_path: str) -> str:
+    output_path = "/tmp/converted_audio.wav"
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            input_path,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-f",
+            "wav",
+            output_path,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    return output_path
+
+
+def upload_file_to_gcs(local_path: str, extension: str = "wav") -> str:
+    bucket = gcs_client.bucket(BUCKET_NAME)
+    filename = f"transcripts/{uuid.uuid4()}.{extension}"
+    blob = bucket.blob(filename)
+    blob.upload_from_filename(local_path)
+    return f"gs://{BUCKET_NAME}/{filename}"
+
+
+def transcribe_audio(audio_file: str) -> str:
+    with wave.open(audio_file, "rb") as w:
+        sample_rate = w.getframerate()
+        frames = w.getnframes()
+        duration_seconds = frames / float(sample_rate) if sample_rate else 0
+
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=sample_rate,
+        language_code="en-US",
+    )
+
+    file_size = os.path.getsize(audio_file)
+
+    # Use async for anything over ~55 seconds or larger files
+    if duration_seconds <= 55 and file_size <= 9 * 1024 * 1024:
+        with open(audio_file, "rb") as f:
+            content = f.read()
+
+        audio = speech.RecognitionAudio(content=content)
+        response = speech_client.recognize(config=config, audio=audio)
+    else:
+        gcs_uri = upload_file_to_gcs(audio_file, "wav")
+        audio = speech.RecognitionAudio(uri=gcs_uri)
+        operation = speech_client.long_running_recognize(config=config, audio=audio)
+        response = operation.result(timeout=600)
+
+    transcript = ""
+
+    for result in response.results:
+        transcript += result.alternatives[0].transcript + " "
+
+    return transcript.strip()
+
+
+# -------- MEDIA INGESTION ENDPOINT --------
+
+@app.post("/ingest")
+async def ingest(
+    situation: str = Form(None),
+    url: str = Form(None),
+    file: UploadFile = File(None),
+):
+
+    if situation:
+        text_input = situation
+
+    elif url:
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+
+        if "youtube.com" in host or "youtu.be" in host:
+            audio_path = download_youtube_audio(url)
+            wav_path = convert_to_wav(audio_path)
+            text_input = transcribe_audio(wav_path)
+        else:
+            text_input = extract_article_text(url)
+
+    elif file:
+
+        temp_path = f"/tmp/{file.filename}"
+
+        with open(temp_path, "wb") as f:
+            f.write(await file.read())
+
+        logger.info(f"ingest upload filename={file.filename} content_type={file.content_type}")
+
+        content_type = (file.content_type or "").lower()
+        filename = (file.filename or "").lower()
+
+        if content_type.startswith("video") or filename.endswith((".mp4", ".mov", ".webm", ".mkv")):
+
+            audio_path = extract_audio_from_video(temp_path)
+            text_input = transcribe_audio(audio_path)
+
+        elif (
+            content_type.startswith("audio")
+            or content_type in ("application/octet-stream", "audio/wav", "audio/x-wav")
+            or filename.endswith((".wav", ".mp3", ".m4a", ".ogg"))
+        ):
+
+            text_input = transcribe_audio(temp_path)
+
+        else:
+            raise HTTPException(400, f"Unsupported file type: {file.content_type}")
+
+    else:
+        raise HTTPException(400, "No input provided")
+
+    if not text_input or not text_input.strip():
+        return {
+            "input_summary": "",
+            "perspective": "No usable text could be extracted.",
+            "full_text_available": False,
+            "transcript_length": 0,
+        }
+
+    import httpx
+
+    session_id = str(uuid.uuid4())
+    user_id = "ruchi"
+    angle = "empathy"
+    clean_situation = sanitize_input(text_input[:4000])
+    prompt = f"Shift {clean_situation} using {angle}"
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        session_url = f"http://localhost:8080/adk/apps/{APP_NAME}/users/{user_id}/sessions/{session_id}"
+        await client.post(session_url, json={})
+
+        run_resp = await client.post(
+            "http://localhost:8080/adk/run",
+            json={
+                "app_name": APP_NAME,
+                "user_id": user_id,
+                "session_id": session_id,
+                "new_message": {
+                    "role": "user",
+                    "parts": [{"text": prompt}]
+                },
+                "streaming": False
+            }
+        )
+        run_resp.raise_for_status()
+        events = run_resp.json()
+
+    final_text = None
+    for event in reversed(events):
+        content = event.get("content") or {}
+        for part in (content.get("parts") or []):
+            if part.get("text"):
+                final_text = part["text"]
+                break
+        if final_text:
+            break
+
+    if not final_text:
+        raise HTTPException(500, "ADK returned no text output")
+
+    try:
+        cleaned = final_text.strip()
+
+        if cleaned.startswith("```"):
+            cleaned = cleaned.replace("```json", "", 1)
+            cleaned = cleaned.replace("```", "")
+            cleaned = cleaned.strip()
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1:
+            cleaned = cleaned[start:end + 1]
+
+        parsed = json.loads(cleaned)
+
+        facts = parsed.get("facts", [])
+        if isinstance(facts, list):
+            normalized_facts = []
+            for item in facts:
+                if isinstance(item, str):
+                    normalized_facts.append({
+                        "fact": item,
+                        "confidence": "moderate",
+                        "source_hint": ""
+                    })
+                elif isinstance(item, dict):
+                    normalized_facts.append({
+                        "fact": item.get("fact", ""),
+                        "confidence": item.get("confidence", "moderate"),
+                        "source_hint": item.get("source_hint", "")
+                    })
+                else:
+                    normalized_facts.append({
+                        "fact": str(item),
+                        "confidence": "moderate",
+                        "source_hint": ""
+                    })
+        else:
+            normalized_facts = []
+
+        return {
+            "session_id": session_id,
+            "input_summary": text_input[:500],
+            "full_text_available": True,
+            "transcript_length": len(text_input or ""),
+            "perspective": parsed.get("the_other_side") or cleaned,
+            "headline": parsed.get("headline"),
+            "the_other_side": parsed.get("the_other_side"),
+            "facts": normalized_facts,
+            "category": parsed.get("category"),
+            "media_type": parsed.get("media_type", "text"),
+            "generation_payload": parsed.get("generation_payload", {}),
+            "angle_label": parsed.get("angle_label"),
+            "closing_prompt": parsed.get("closing_prompt"),
+            "declined": parsed.get("declined", False),
+        }
+    except Exception:
+        return {
+            "session_id": session_id,
+            "input_summary": text_input[:500],
+            "full_text_available": True,
+            "transcript_length": len(text_input or ""),
+            "perspective": final_text,
+            "media_type": "text",
+            "raw_response": final_text,
+        }
+

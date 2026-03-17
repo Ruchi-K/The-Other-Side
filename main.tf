@@ -1,4 +1,3 @@
-# main.tf — Automated Infrastructure for The Other Side
 terraform {
   required_providers {
     google = {
@@ -9,56 +8,39 @@ terraform {
 }
 
 provider "google" {
-  # Plugged in from your main.py config
-  project = "the-other-side-489308" 
+  project = "the-other-side-489308"
   region  = "us-central1"
 }
 
-# 1. Enable Required APIs (Matches your deploy.sh list)
-resource "google_project_service" "services" {
-  for_each = toset([
-    "run.googleapis.com",
-    "aiplatform.googleapis.com",
-    "texttospeech.googleapis.com",
-    "storage.googleapis.com",
-    "firestore.googleapis.com",
-    "vision.googleapis.com",
-    "cloudbuild.googleapis.com",
-    "artifactregistry.googleapis.com"
-  ])
-  service = each.key
-  disable_on_destroy = false
-}
-
-# 2. GCS Bucket for Videos (Matches your BUCKET_NAME)
+# 1. GCS Bucket for Videos
 resource "google_storage_bucket" "video_bucket" {
-  name          = "the-other-side-videos-489308"
+  name          = "the-other-side-489308-tos-videos"
   location      = "US-CENTRAL1"
   force_destroy = true
-
-  # Allow public viewing of generated videos as per your gsutil command
   uniform_bucket_level_access = true
 }
 
+# 2. Public Access for Video Viewing
 resource "google_storage_bucket_iam_binding" "public_rule" {
   bucket = google_storage_bucket.video_bucket.name
   role   = "roles/storage.objectViewer"
   members = ["allUsers"]
 }
 
-# 3. Firestore Database
+# 3. Firestore Database (For ADK Session persistence if needed later)
 resource "google_firestore_database" "database" {
   name        = "(default)"
   location_id = "us-central1"
   type        = "FIRESTORE_NATIVE"
 }
 
-# 4. Service Account & IAM Roles
+# 4. Service Account
 resource "google_service_account" "sa" {
   account_id   = "the-other-side-sa"
   display_name = "The Other Side Service Account"
 }
 
+# 5. Roles required for ADK and Gemini
 resource "google_project_iam_member" "sa_roles" {
   for_each = toset([
     "roles/aiplatform.user",
